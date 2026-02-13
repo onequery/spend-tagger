@@ -79,6 +79,22 @@ CARD_COMPANY_TERMS = (
     "bc카드",
 )
 MANUAL_REVIEW_TRANSFER_TERMS = ("타행송금", "타행이체")
+CARD_SETTLEMENT_ACTION_TERMS = (
+    "자동이체",
+    "이체",
+    "출금",
+    "납부",
+    "결제",
+    "청구",
+    "대금",
+)
+DEFAULT_MODEL_OPTIONS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "o4-mini",
+]
 
 
 @dataclass
@@ -88,6 +104,15 @@ class TagSuggestion:
     confidence: float
     source: str
     reason: str = ""
+
+
+@dataclass
+class CardPaymentAssessment:
+    needs_manual_review: bool
+    confidence: float
+    reason: str = ""
+    suggested_category: str = ""
+    suggested_subcategory: str = ""
 
 
 @dataclass
@@ -302,38 +327,96 @@ def is_bank_source(source_file: str) -> bool:
     return any(k in source for k in BANK_SOURCE_KEYWORDS)
 
 
-def is_monthly_card_settlement(merchant: str, source_file: str) -> bool:
+def _compact_text(text: str) -> str:
+    return _normalize_text(text).replace(" ", "")
+
+
+def is_monthly_card_settlement(merchant: str, source_file: str, transaction_type: str = "") -> bool:
     if not is_bank_source(source_file):
         return False
 
-    raw = _normalize_text(merchant)
-    compact = raw.replace(" ", "")
-    if not compact:
+    compact_merchant = _compact_text(merchant)
+    compact_tx_type = _compact_text(transaction_type)
+    if not compact_merchant:
         return False
 
-    if any(term in compact for term in CARD_SETTLEMENT_TERMS):
+    if any(term in compact_merchant for term in CARD_SETTLEMENT_TERMS):
         return True
 
-    if any(term in compact for term in CARD_COMPANY_TERMS):
+    has_company = any(term in compact_merchant for term in CARD_COMPANY_TERMS)
+    has_action = any(term in compact_merchant for term in CARD_SETTLEMENT_ACTION_TERMS) or any(
+        term in compact_tx_type for term in CARD_SETTLEMENT_ACTION_TERMS
+    )
+    if has_company and has_action:
         return True
 
-    # 예: "카드사 자동이체", "카드 출금" 등
-    if "카드" in compact and any(k in compact for k in ("이체", "출금", "자동", "납부", "결제", "청구")):
+    # 예: "카드사 자동이체", "카드 출금"
+    if "카드" in compact_merchant and has_action:
         return True
     return False
 
 
-def requires_manual_classification(merchant: str, category: str, subcategory: str, transaction_type: str = "") -> bool:
+def is_suspected_monthly_card_settlement(merchant: str, source_file: str, transaction_type: str = "") -> bool:
+    if is_monthly_card_settlement(merchant, source_file, transaction_type):
+        return True
+
+    compact_merchant = _compact_text(merchant)
+    compact_tx_type = _compact_text(transaction_type)
+    if not compact_merchant:
+        return False
+
+    has_settlement_keyword = any(term in compact_merchant for term in CARD_SETTLEMENT_TERMS)
+    has_company = any(term in compact_merchant for term in CARD_COMPANY_TERMS)
+    has_card_word = "카드" in compact_merchant
+    has_action = any(term in compact_merchant for term in CARD_SETTLEMENT_ACTION_TERMS) or any(
+        term in compact_tx_type for term in CARD_SETTLEMENT_ACTION_TERMS
+    )
+
+    if has_settlement_keyword:
+        return True
+    if has_company and has_action:
+        return True
+    if has_card_word and has_action:
+        return True
+    return False
+
+
+def is_card_payment_candidate(merchant: str, transaction_type: str = "") -> bool:
+    compact_merchant = _compact_text(merchant)
+    compact_tx_type = _compact_text(transaction_type)
+    if not compact_merchant:
+        return False
+
+    if any(term in compact_merchant for term in CARD_SETTLEMENT_TERMS):
+        return True
+    if any(term in compact_merchant for term in CARD_COMPANY_TERMS):
+        return True
+    if "카드" in compact_merchant and any(term in compact_merchant for term in CARD_SETTLEMENT_ACTION_TERMS):
+        return True
+    if "카드" in compact_merchant and any(term in compact_tx_type for term in CARD_SETTLEMENT_ACTION_TERMS):
+        return True
+    return False
+
+
+def requires_manual_classification(
+    merchant: str,
+    category: str,
+    subcategory: str,
+    transaction_type: str = "",
+    source_file: str = "",
+) -> bool:
     cat = str(category).strip()
     sub = str(subcategory).strip()
     if cat in EXCLUDED_CATEGORIES:
         return False
 
-    compact_merchant = _normalize_text(merchant).replace(" ", "")
-    compact_tx_type = _normalize_text(transaction_type).replace(" ", "")
+    compact_merchant = _compact_text(merchant)
+    compact_tx_type = _compact_text(transaction_type)
     if any(term in compact_tx_type for term in MANUAL_REVIEW_TRANSFER_TERMS):
         return True
     if any(term in compact_merchant for term in MANUAL_REVIEW_TRANSFER_TERMS):
+        return True
+    if is_suspected_monthly_card_settlement(merchant, source_file, transaction_type):
         return True
 
     if cat == "미분류" or sub == "미분류":
@@ -551,7 +634,14 @@ def _postprocess_normalized(out: pd.DataFrame, source_file: str) -> pd.DataFrame
     out["지출날짜"] = pd.to_datetime(out["지출날짜"], errors="coerce")
 
     # 은행계좌에서 빠져나가는 월별 카드결제 대금은 지출 분석에서 제외 처리.
-    settlement_mask = out["사용처"].apply(lambda x: is_monthly_card_settlement(str(x), source_file))
+    settlement_mask = out.apply(
+        lambda r: is_monthly_card_settlement(
+            str(r.get("사용처", "")),
+            source_file,
+            str(r.get("거래구분", "")),
+        ),
+        axis=1,
+    )
     if settlement_mask.any():
         out.loc[settlement_mask, "카테고리"] = "제외"
         out.loc[settlement_mask, "세부 카테고리"] = "카드결제(월납)"
@@ -923,11 +1013,89 @@ class OpenAITagger:
         self.model = model.strip() or "gpt-4o-mini"
         self.timeout = timeout
 
+    def assess_card_payment_clarity(
+        self,
+        merchant: str,
+        transaction_type: str,
+        source_file: str,
+    ) -> CardPaymentAssessment | None:
+        if not self.api_key:
+            return None
+
+        system_prompt = (
+            "너는 거래내역 라인에서 '카드결제 대금/카드사 청구'처럼 사용처가 불명확한 항목을 판별하는 필터다. "
+            "반드시 JSON만 출력한다. "
+            '필드: needs_manual_review(boolean), confidence(number 0~1), reason(string), '
+            'suggested_category(string), suggested_subcategory(string). '
+            "직접 소비처(가맹점)를 알 수 없는 카드결제/카드대금/카드청구/자동이체 성격이면 "
+            "needs_manual_review=true로 반환한다."
+        )
+        user_prompt = (
+            f"사용처: {merchant}\n"
+            f"거래구분: {transaction_type}\n"
+            f"출처파일: {source_file}\n\n"
+            "이 항목은 사용자가 직접 분류해야 하는지 판별해줘."
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            data = json.loads(content)
+        except Exception:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        raw_manual = data.get("needs_manual_review", False)
+        needs_manual = bool(raw_manual) if isinstance(raw_manual, bool) else str(raw_manual).strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "y",
+        )
+        try:
+            confidence = float(data.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        return CardPaymentAssessment(
+            needs_manual_review=needs_manual,
+            confidence=confidence,
+            reason=str(data.get("reason", "")).strip(),
+            suggested_category=str(data.get("suggested_category", "")).strip(),
+            suggested_subcategory=str(data.get("suggested_subcategory", "")).strip(),
+        )
+
     def classify(
         self,
         merchant: str,
         amount: float,
         date_text: str,
+        transaction_type: str,
+        source_file: str,
         taxonomy: dict[str, list[str]],
     ) -> TagSuggestion | None:
         if not self.api_key:
@@ -942,12 +1110,17 @@ class OpenAITagger:
         system_prompt = (
             "너는 가계부 거래 내역 분류기다. 반드시 JSON만 출력한다. "
             '필드: category(string), subcategory(string), confidence(number 0~1), reason(string). '
-            "category/subcategory는 한국어로 작성한다."
+            "category/subcategory는 한국어로 작성한다. "
+            '중요: "카드결제/카드대금/카드청구/카드납부/카드사 자동이체" 성격은 '
+            '소비(쇼핑/가전 등)로 분류하지 말고 category="제외", subcategory="카드결제(월납)"을 우선 고려한다. '
+            "애매하면 confidence는 0.4 이하로 낮게 준다."
         )
         user_prompt = (
             f"거래일: {date_text}\n"
             f"사용처: {merchant}\n"
-            f"금액: {amount:,.0f}\n\n"
+            f"금액: {amount:,.0f}\n"
+            f"거래구분: {transaction_type}\n"
+            f"출처파일: {source_file}\n\n"
             f"가능한 카테고리/세부카테고리 참고:\n{taxonomy_text}\n\n"
             "가장 적합한 카테고리와 세부카테고리를 추정해줘."
         )
@@ -1517,10 +1690,10 @@ def auto_tag(
     allowed_categories = set(taxonomy.keys())
     uncertain: list[int] = []
 
-    def queue_manual_required(idx: int, merchant: str, tx_type: str) -> bool:
+    def queue_manual_required(idx: int, merchant: str, tx_type: str, source_file: str) -> bool:
         cur_cat = str(out.at[idx, "카테고리"]).strip()
         cur_sub = str(out.at[idx, "세부 카테고리"]).strip()
-        if requires_manual_classification(merchant, cur_cat, cur_sub, tx_type):
+        if requires_manual_classification(merchant, cur_cat, cur_sub, tx_type, source_file):
             out.at[idx, "추천카테고리"] = cur_cat
             out.at[idx, "추천세부카테고리"] = cur_sub or "미분류"
             out.at[idx, "자동태깅근거"] = "review:ambiguous_manual_required"
@@ -1533,11 +1706,32 @@ def auto_tag(
             return True
         return False
 
+    def queue_card_manual(
+        idx: int,
+        assessment: CardPaymentAssessment | None = None,
+        reason_suffix: str = "card_payment_unclear",
+    ) -> None:
+        suggested_cat = ""
+        suggested_sub = ""
+        conf = 0.05
+        if assessment is not None:
+            suggested_cat = assessment.suggested_category
+            suggested_sub = assessment.suggested_subcategory
+            conf = max(conf, assessment.confidence)
+
+        out.at[idx, "추천카테고리"] = suggested_cat
+        out.at[idx, "추천세부카테고리"] = suggested_sub
+        out.at[idx, "자동태깅근거"] = f"review:ambiguous_manual_required:{reason_suffix}"
+        out.at[idx, "신뢰도"] = round(float(max(0.01, conf)), 3)
+        if idx not in uncertain:
+            uncertain.append(idx)
+
     for idx, row in out.iterrows():
         cat = str(row["카테고리"]).strip()
         sub = str(row["세부 카테고리"]).strip()
         merchant = str(row["사용처"]).strip()
         tx_type = str(row.get("거래구분", "")).strip()
+        source_file = str(row.get("출처파일", "")).strip()
 
         if cat in EXCLUDED_CATEGORIES:
             if not sub:
@@ -1545,6 +1739,17 @@ def auto_tag(
             out.at[idx, "자동태깅근거"] = "preset_excluded"
             out.at[idx, "신뢰도"] = 1.0
             continue
+
+        # 카드결제/카드대금 성격은 rule_exact보다 먼저 AI로 '수동검토 필요' 여부를 판별한다.
+        if is_card_payment_candidate(merchant, tx_type):
+            ai_assessment = ai_tagger.assess_card_payment_clarity(merchant, tx_type, source_file) if ai_tagger else None
+            if ai_assessment is not None:
+                if ai_assessment.needs_manual_review:
+                    queue_card_manual(idx, ai_assessment, "card_payment_unclear_ai")
+                    continue
+            elif is_suspected_monthly_card_settlement(merchant, source_file, tx_type):
+                queue_card_manual(idx, None, "card_payment_unclear_rule")
+                continue
 
         if cat and cat.lower() != "nan" and cat not in allowed_categories:
             cat = ""
@@ -1565,7 +1770,7 @@ def auto_tag(
                     out.at[idx, "신뢰도"] = round(rule.confidence, 3)
                 else:
                     out.at[idx, "세부 카테고리"] = "미분류"
-            queue_manual_required(idx, merchant, tx_type)
+            queue_manual_required(idx, merchant, tx_type, source_file)
             continue
 
         rule = suggest_from_rules(merchant, kb)
@@ -1579,7 +1784,7 @@ def auto_tag(
             out.at[idx, "세부 카테고리"] = rule.subcategory or "미분류"
             out.at[idx, "자동태깅근거"] = rule.source
             out.at[idx, "신뢰도"] = round(rule.confidence, 3)
-            queue_manual_required(idx, merchant, tx_type)
+            queue_manual_required(idx, merchant, tx_type, source_file)
             continue
 
         if ai_tagger is not None:
@@ -1588,6 +1793,8 @@ def auto_tag(
                 merchant=merchant,
                 amount=float(row["지출금액"]),
                 date_text=date_text,
+                transaction_type=tx_type,
+                source_file=source_file,
                 taxonomy=taxonomy,
             )
             if ai and ai.category:
@@ -1600,7 +1807,7 @@ def auto_tag(
                     out.at[idx, "세부 카테고리"] = ai.subcategory or "미분류"
                     out.at[idx, "자동태깅근거"] = "ai"
                     out.at[idx, "신뢰도"] = round(ai.confidence, 3)
-                    queue_manual_required(idx, merchant, tx_type)
+                    queue_manual_required(idx, merchant, tx_type, source_file)
                     continue
 
         uncertain.append(idx)
@@ -1762,6 +1969,7 @@ class SpendingTaggerApp:
         self.files: list[Path] = []
         self.ontology: dict[str, list[str]] = load_ontology()
         self.mapping_profiles: list[dict] = load_mapping_profiles()
+        self.model_options: list[str] = list(DEFAULT_MODEL_OPTIONS)
         if not ONTOLOGY_PATH.exists():
             save_ontology(self.ontology)
         if not MAPPING_PROFILES_PATH.exists():
@@ -1810,10 +2018,14 @@ class SpendingTaggerApp:
 
         ttk.Label(ai_frame, text="모델").grid(row=2, column=0, sticky="w", padx=8)
         self.model_var = tk.StringVar(value="gpt-4o-mini")
-        ttk.Entry(ai_frame, textvariable=self.model_var).grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=4)
+        self.model_combo = ttk.Combobox(ai_frame, textvariable=self.model_var, values=self.model_options, width=36)
+        self.model_combo.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=4)
+        ttk.Button(ai_frame, text="모델 목록 갱신", command=self.refresh_model_options).grid(
+            row=2, column=2, sticky="ew", padx=(0, 8), pady=4
+        )
 
         ttk.Label(ai_frame, text="자동확정 신뢰도(0~1)").grid(row=3, column=0, sticky="w", padx=8, pady=(0, 8))
-        self.threshold_var = tk.StringVar(value="0.75")
+        self.threshold_var = tk.StringVar(value="0.90")
         ttk.Entry(ai_frame, textvariable=self.threshold_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(0, 8))
         ai_frame.columnconfigure(1, weight=1)
 
@@ -1852,6 +2064,8 @@ class SpendingTaggerApp:
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.refresh_ontology_summary()
         self.refresh_mapping_profile_summary()
+        if self.api_key_var.get().strip():
+            self.root.after(50, lambda: self.refresh_model_options(show_message=False))
 
     def log(self, msg: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1915,6 +2129,95 @@ class SpendingTaggerApp:
             return
         self.api_key_var.set(str(text).strip())
         self.log("API Key를 클립보드에서 붙여넣었습니다.")
+        self.refresh_model_options(show_message=False)
+
+    @staticmethod
+    def _filter_chat_model_ids(model_ids: list[str]) -> list[str]:
+        blocked_terms = (
+            "audio",
+            "transcribe",
+            "tts",
+            "whisper",
+            "embedding",
+            "moderation",
+            "image",
+            "search",
+            "realtime",
+        )
+        out: list[str] = []
+        for model_id in model_ids:
+            mid = str(model_id).strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            if not (low.startswith("gpt-") or low.startswith("o1") or low.startswith("o3") or low.startswith("o4")):
+                continue
+            if any(term in low for term in blocked_terms):
+                continue
+            out.append(mid)
+        return sorted(set(out))
+
+    def _fetch_openai_model_ids(self, api_key: str) -> list[str]:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key.strip()}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        data = body.get("data", [])
+        if not isinstance(data, list):
+            return []
+        return [str(item.get("id", "")).strip() for item in data if isinstance(item, dict)]
+
+    def refresh_model_options(self, show_message: bool = True) -> None:
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            if show_message:
+                messagebox.showwarning("확인", "모델 목록을 불러오려면 API Key를 입력해 주세요.")
+            return
+
+        try:
+            model_ids = self._fetch_openai_model_ids(api_key)
+            candidates = self._filter_chat_model_ids(model_ids)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            msg = f"HTTP {e.code}"
+            if detail:
+                msg = f"{msg}: {detail[:200]}"
+            if show_message:
+                messagebox.showerror("오류", f"모델 목록 조회 실패: {msg}")
+            self.log(f"모델 목록 조회 실패: {msg}")
+            return
+        except Exception as e:
+            if show_message:
+                messagebox.showerror("오류", f"모델 목록 조회 실패: {type(e).__name__}: {e}")
+            self.log(f"모델 목록 조회 실패: {type(e).__name__}: {e}")
+            return
+
+        merged = list(DEFAULT_MODEL_OPTIONS)
+        for m in candidates:
+            if m not in merged:
+                merged.append(m)
+        self.model_options = merged
+        self.model_combo["values"] = self.model_options
+
+        current = self.model_var.get().strip()
+        if not current:
+            self.model_var.set(self.model_options[0])
+        elif current not in self.model_options:
+            self.model_var.set(current)
+            if current not in self.model_options:
+                self.model_options.append(current)
+                self.model_combo["values"] = self.model_options
+
+        self.log(f"모델 목록 갱신: {len(candidates)}개 수신, 선택 가능 {len(self.model_options)}개")
+        if show_message:
+            messagebox.showinfo("완료", f"모델 목록 갱신 완료 ({len(candidates)}개)")
 
     def refresh_ontology_summary(self) -> None:
         categories = len(self.ontology)
@@ -2093,7 +2396,7 @@ class SpendingTaggerApp:
                 if mandatory_indices:
                     messagebox.showinfo(
                         "필수 분류 필요",
-                        f'미분류 또는 "타행송금/타행이체" 성격의 항목 {len(mandatory_indices)}건은 '
+                        f'미분류, "타행송금/타행이체", 또는 "카드결제(사용처 불명확)" 항목 {len(mandatory_indices)}건은 '
                         "반드시 사용 목적을 분류해야 합니다.",
                     )
                     tagged = self._review_uncertain(tagged, uncertain, kb)
@@ -2105,7 +2408,7 @@ class SpendingTaggerApp:
                     ]
                     if unresolved:
                         raise ValueError(
-                            f'미분류/타행송금 계열 항목 {len(unresolved)}건이 아직 분류되지 않았습니다. '
+                            f'필수 분류 대상(미분류/타행송금/카드결제 사용처 불명확) {len(unresolved)}건이 아직 분류되지 않았습니다. '
                             "해당 항목을 분류 후 다시 실행해 주세요."
                         )
                 elif optional_indices:
