@@ -49,6 +49,13 @@ python spending_tagger_app.py
 
 빌드 결과: `dist/SpendTagger.app`
 
+## Windows 11 `.exe` 자동 빌드
+
+- GitHub Actions에 `Build Windows EXE` 워크플로우가 포함되어 있습니다.
+- `Actions` 탭에서 수동 실행(`Run workflow`)하면, 아티팩트로 `SpendTagger-windows-exe`를 받을 수 있습니다.
+- 내려받은 `SpendTagger.exe` 파일 하나만 다른 Windows PC에 전달해 실행할 수 있습니다.
+- 자세한 절차: `README_windows_build.md`
+
 ## GitHub 업로드 시 개인정보 보호
 
 `.gitignore`에 아래 항목들이 포함되어 있어 기본적으로 업로드에서 제외됩니다.
@@ -62,3 +69,4 @@ python spending_tagger_app.py
 ## 상세 문서
 
 - `README_mac_app.md`: 앱 기능과 사용 흐름 상세 설명
+- `README_windows_build.md`: Windows 빌드/배포 절차
