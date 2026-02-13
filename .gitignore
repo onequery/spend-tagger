@@ -1,0 +1,39 @@
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Python cache / env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime/cache/build artifacts
+.cache/
+.mplconfig/
+app_output/
+charts/
+dist/
+build/
+*.spec
+*.log
+
+# Local app bundles
+*.app/
+
+# Sensitive / local data exports
+*.xls
+*.xlsx
+tagging_memory.csv
+column_mapping_profiles.json
+
+# Optional secrets
+.env
+.env.*
