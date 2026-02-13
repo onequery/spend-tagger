@@ -186,7 +186,7 @@ def _build_cfb_streams(path: Path) -> Dict[str, bytes]:
     return streams
 
 
-def _parse_biff_xls(path: Path) -> pd.DataFrame:
+def _parse_biff_xls_raw(path: Path) -> pd.DataFrame:
     streams = _build_cfb_streams(path)
     wb = streams.get("Workbook") or streams.get("Book")
     if wb is None:
@@ -306,7 +306,11 @@ def _parse_biff_xls(path: Path) -> pd.DataFrame:
             row.append(v)
         rows.append(row)
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def _parse_biff_xls(path: Path) -> pd.DataFrame:
+    df = _parse_biff_xls_raw(path)
     header_idx = _find_header_row(df)
     if header_idx is None:
         raise ValueError(f"{path.name}: header row not found")

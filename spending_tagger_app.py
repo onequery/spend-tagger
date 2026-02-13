@@ -24,7 +24,7 @@ import pandas as pd
 from matplotlib import font_manager, rcParams
 from openpyxl import load_workbook
 
-from merge_transactions import _parse_biff_xls, _read_strict_xlsx
+from merge_transactions import _parse_biff_xls, _parse_biff_xls_raw, _read_strict_xlsx
 
 warnings.filterwarnings("ignore", message=r"Glyph .* missing from font")
 
@@ -200,6 +200,49 @@ def _normalize_profile(raw: dict) -> dict | None:
     }
 
 
+def _resolve_column_name(requested: str, candidates: list[str]) -> str:
+    wanted = str(requested).strip()
+    if not wanted:
+        return ""
+    if wanted in candidates:
+        return wanted
+
+    wanted_norm = _normalize_text(wanted).replace(" ", "")
+    for cand in candidates:
+        if _normalize_text(cand).replace(" ", "") == wanted_norm:
+            return cand
+    return ""
+
+
+def validate_mapping_profile(raw_df: pd.DataFrame, profile: dict) -> dict | None:
+    norm = _normalize_profile(profile)
+    if norm is None or raw_df is None or raw_df.empty:
+        return None
+
+    try:
+        shaped = build_dataframe_from_raw(raw_df, int(norm.get("header_row", 0)))
+    except Exception:
+        return None
+    if shaped.empty:
+        return None
+
+    shaped_cols = [str(c).strip() for c in shaped.columns]
+    resolved_map: dict[str, str] = {}
+    for target, src in norm.get("column_map", {}).items():
+        resolved = _resolve_column_name(str(src), shaped_cols)
+        if resolved:
+            resolved_map[target] = resolved
+
+    norm["column_map"] = resolved_map
+    for target in REQUIRED_TARGET_COLUMNS:
+        src = str(resolved_map.get(target, "")).strip()
+        if not src:
+            return None
+        if src not in shaped_cols:
+            return None
+    return norm
+
+
 def load_mapping_profiles() -> list[dict]:
     if not MAPPING_PROFILES_PATH.exists():
         return []
@@ -307,6 +350,50 @@ def _make_unique_headers(headers: list[str]) -> list[str]:
         counts[base] = n
         out.append(base if n == 1 else f"{base}#{n}")
     return out
+
+
+def guess_header_row(raw_df: pd.DataFrame) -> int:
+    if raw_df is None or raw_df.empty:
+        return 0
+
+    hints = {
+        "날짜",
+        "거래일시",
+        "거래일",
+        "거래일자",
+        "승인일",
+        "승인일자",
+        "지출날짜",
+        "사용처",
+        "거래처",
+        "가맹점명",
+        "가맹점",
+        "상호",
+        "상호명",
+        "금액",
+        "거래금액",
+        "사용금액",
+        "지출금액",
+        "승인금액",
+    }
+
+    scan_limit = min(len(raw_df), 40)
+    for i in range(scan_limit):
+        vals = {str(v).strip() for v in raw_df.iloc[i].tolist() if str(v).strip()}
+        if len(vals & hints) >= 2:
+            return i
+
+    best_idx = 0
+    best_score = -1
+    for i in range(min(len(raw_df), 20)):
+        row_vals = [str(v).strip() for v in raw_df.iloc[i].tolist()]
+        non_empty = [v for v in row_vals if v]
+        unique_count = len(set(non_empty))
+        score = len(non_empty) + unique_count
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
 
 
 def build_dataframe_from_raw(raw_df: pd.DataFrame, header_row: int) -> pd.DataFrame:
@@ -419,6 +506,11 @@ def _read_strict_xlsx_raw(path: Path) -> pd.DataFrame:
 
 def read_excel_raw_sheet(path: Path) -> pd.DataFrame | None:
     ext = path.suffix.lower()
+    if ext == ".xls":
+        try:
+            return _parse_biff_xls_raw(path)
+        except Exception:
+            return None
     if ext != ".xlsx":
         return None
     try:
@@ -504,21 +596,9 @@ def find_matching_profile(profiles: list[dict], source_name: str, raw_df: pd.Dat
         keyword = _normalize_text(profile.get("source_keyword", ""))
         if keyword and keyword not in source_norm:
             continue
-        try:
-            shaped = build_dataframe_from_raw(raw_df, int(profile.get("header_row", 0)))
-        except Exception:
-            continue
-        col_map = profile.get("column_map", {})
-        if not isinstance(col_map, dict):
-            continue
-        ok = True
-        for target in REQUIRED_TARGET_COLUMNS:
-            src = str(col_map.get(target, "")).strip()
-            if not src or src not in shaped.columns:
-                ok = False
-                break
-        if ok:
-            return profile
+        validated = validate_mapping_profile(raw_df, profile)
+        if validated is not None:
+            return validated
     return None
 
 
@@ -535,12 +615,30 @@ def _upsert_mapping_profile(profiles: list[dict], profile: dict) -> None:
     profiles.append(norm)
 
 
-def load_and_merge(files: list[Path], logger, mapping_profiles: list[dict] | None = None, mapping_prompt=None) -> pd.DataFrame:
+def load_and_merge(
+    files: list[Path],
+    logger,
+    mapping_profiles: list[dict] | None = None,
+    mapping_prompt=None,
+    ai_mapping_suggester=None,
+) -> pd.DataFrame:
     profiles = mapping_profiles if mapping_profiles is not None else []
     parts: list[pd.DataFrame] = []
     for p in files:
         logger(f"읽는 중: {p.name}")
-        raw = read_excel_flexible(p)
+        raw_sheet = read_excel_raw_sheet(p)
+        try:
+            raw = read_excel_flexible(p)
+        except Exception as e:
+            if raw_sheet is None or raw_sheet.empty:
+                raise
+            guessed_header_row = guess_header_row(raw_sheet)
+            logger(
+                f"  - 표준 파서 실패({type(e).__name__}: {e}) -> "
+                f"헤더 추정 {guessed_header_row + 1}행으로 재시도"
+            )
+            raw = build_dataframe_from_raw(raw_sheet, guessed_header_row)
+
         alias_map = infer_alias_mapping(list(raw.columns))
         missing_required = [t for t in REQUIRED_TARGET_COLUMNS if t not in alias_map]
         norm = normalize_columns(raw, p.name)
@@ -548,7 +646,6 @@ def load_and_merge(files: list[Path], logger, mapping_profiles: list[dict] | Non
 
         if missing_required:
             logger(f"  - 기본 컬럼 매핑 누락: {', '.join(missing_required)}")
-            raw_sheet = read_excel_raw_sheet(p)
             if raw_sheet is None or raw_sheet.empty:
                 raw_sheet = dataframe_to_raw_like(raw)
 
@@ -557,11 +654,22 @@ def load_and_merge(files: list[Path], logger, mapping_profiles: list[dict] | Non
                 norm = normalize_columns_with_profile(raw_sheet, p.name, matched)
                 profile_used = matched
                 logger(f"  - 저장된 매핑 프로필 적용: {matched.get('profile_name', '')}")
-            elif mapping_prompt is not None:
-                manual_profile = mapping_prompt(p, raw_sheet)
-                if manual_profile is None:
-                    raise ValueError(f"{p.name}: 컬럼 매핑이 필요합니다.")
-                norm = normalize_columns_with_profile(raw_sheet, p.name, manual_profile)
+            else:
+                if ai_mapping_suggester is not None:
+                    ai_profile = ai_mapping_suggester.suggest_profile(p, raw_sheet, missing_required)
+                    if ai_profile is not None:
+                        norm = normalize_columns_with_profile(raw_sheet, p.name, ai_profile)
+                        profile_used = ai_profile
+                        _upsert_mapping_profile(profiles, ai_profile)
+                        logger(f"  - GPT 포맷 매핑 적용: {ai_profile.get('profile_name', '')}")
+                    else:
+                        logger("  - GPT 포맷 매핑 실패(수동 매핑으로 전환)")
+
+                if profile_used is None and mapping_prompt is not None:
+                    manual_profile = mapping_prompt(p, raw_sheet)
+                    if manual_profile is None:
+                        raise ValueError(f"{p.name}: 컬럼 매핑이 필요합니다.")
+                    norm = normalize_columns_with_profile(raw_sheet, p.name, manual_profile)
 
         parts.append(norm)
         logger(f"  - {len(norm)}건 로드")
@@ -700,6 +808,113 @@ def suggest_from_rules(merchant: str, kb: KnowledgeBase) -> TagSuggestion | None
         conf = min(0.79, 0.45 + 0.34 * ratio)
         return TagSuggestion(cat, sub, conf, "rule_keyword", "사용처 키워드 유사도 기반")
     return None
+
+
+class OpenAIColumnMapper:
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini", timeout: int = 35):
+        self.api_key = api_key.strip()
+        self.model = model.strip() or "gpt-4o-mini"
+        self.timeout = timeout
+
+    @staticmethod
+    def _build_preview(raw_df: pd.DataFrame, max_rows: int = 30, max_cols: int = 24) -> list[list[str]]:
+        if raw_df is None or raw_df.empty:
+            return []
+        clipped = raw_df.iloc[:max_rows, :max_cols].fillna("")
+        preview: list[list[str]] = []
+        for _, row in clipped.iterrows():
+            preview.append([str(v).strip() for v in row.tolist()])
+        return preview
+
+    def suggest_profile(self, source_path: Path, raw_df: pd.DataFrame, missing_required: list[str] | None = None) -> dict | None:
+        if not self.api_key or raw_df is None or raw_df.empty:
+            return None
+
+        preview = self._build_preview(raw_df)
+        if not preview:
+            return None
+
+        system_prompt = (
+            "너는 거래내역 엑셀 포맷 분석기다. 반드시 JSON만 출력한다. "
+            "반환 필드: header_row(number, 0-based), column_map(object). "
+            "column_map은 표준 타겟 컬럼명을 key로, 원본 헤더 문자열을 value로 넣어라."
+        )
+        user_payload = {
+            "source_file": source_path.name,
+            "target_columns": TARGET_COLUMNS,
+            "required_target_columns": REQUIRED_TARGET_COLUMNS,
+            "currently_missing_required": missing_required or [],
+            "alias_examples": get_column_aliases(),
+            "raw_sheet_preview": preview,
+            "rules": [
+                "header_row는 0부터 시작한다.",
+                "column_map value는 반드시 header_row의 셀에 실제로 존재하는 문자열을 사용한다.",
+                "확신 없는 매핑은 생략한다.",
+            ],
+        }
+        user_prompt = json.dumps(user_payload, ensure_ascii=False)
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            data = json.loads(content)
+        except Exception:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+        try:
+            header_row = int(data.get("header_row", 0))
+        except Exception:
+            header_row = 0
+
+        raw_map = data.get("column_map", {})
+        if not isinstance(raw_map, dict):
+            raw_map = {}
+
+        normalized_key_map = {_normalize_text(k).replace(" ", ""): v for k, v in raw_map.items()}
+        column_map: dict[str, str] = {}
+        for target in TARGET_COLUMNS:
+            src = raw_map.get(target, "")
+            if not src:
+                src = normalized_key_map.get(_normalize_text(target).replace(" ", ""), "")
+            src_text = str(src).strip()
+            if src_text:
+                column_map[target] = src_text
+
+        profile_name = f"gpt_auto_{safe_filename(source_path.stem) or 'mapping'}"
+        draft_profile = {
+            "profile_name": profile_name,
+            "source_keyword": source_path.stem,
+            "header_row": max(0, header_row),
+            "column_map": column_map,
+        }
+        validated = validate_mapping_profile(raw_df, draft_profile)
+        if validated is None and header_row > 0:
+            draft_profile["header_row"] = header_row - 1
+            validated = validate_mapping_profile(raw_df, draft_profile)
+        return validated
 
 
 class OpenAITagger:
@@ -866,12 +1081,7 @@ class ColumnMappingDialog(tk.Toplevel):
         ttk.Button(btns, text="취소", command=self._cancel).grid(row=0, column=1, padx=4)
 
     def _guess_header_row(self) -> int:
-        limit = min(len(self.raw_df), 30)
-        for i in range(limit):
-            vals = {str(v).strip() for v in self.raw_df.iloc[i].tolist() if str(v).strip()}
-            if len(vals & {"날짜", "거래일시", "승인일", "사용처", "가맹점명", "금액", "승인금액"}) >= 2:
-                return i
-        return 0
+        return guess_header_row(self.raw_df)
 
     def _current_header_row(self) -> int:
         try:
@@ -1828,13 +2038,24 @@ class SpendingTaggerApp:
         self.log("작업 시작")
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
+            api_key = self.api_key_var.get().strip()
+            model_name = self.model_var.get().strip() or "gpt-4o-mini"
+            ai_mapper = None
+            if api_key:
+                ai_mapper = OpenAIColumnMapper(api_key=api_key, model=model_name)
+                self.log("GPT 포맷 파싱 폴백 활성화")
+            else:
+                self.log("GPT 포맷 파싱 폴백 비활성화(API Key 없음)")
 
             df = load_and_merge(
                 self.files,
                 self.log,
                 mapping_profiles=self.mapping_profiles,
                 mapping_prompt=self.prompt_column_mapping,
+                ai_mapping_suggester=ai_mapper,
             )
+            save_mapping_profiles(self.mapping_profiles)
+            self.refresh_mapping_profile_summary()
             self.log(f"입력 통합: {len(df)}건")
 
             if Path("통합지출내역.xlsx").exists():
@@ -1852,10 +2073,9 @@ class SpendingTaggerApp:
 
             ai_tagger = None
             if self.use_ai_var.get():
-                api_key = self.api_key_var.get().strip()
                 if not api_key:
                     raise ValueError("GPT 자동 태깅을 켰다면 API Key를 입력해야 합니다.")
-                ai_tagger = OpenAITagger(api_key=api_key, model=self.model_var.get().strip() or "gpt-4o-mini")
+                ai_tagger = OpenAITagger(api_key=api_key, model=model_name)
                 self.log("GPT 자동 태깅 활성화")
             else:
                 self.log("GPT 자동 태깅 비활성화(규칙 기반 + 수동검토)")
